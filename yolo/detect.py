@@ -56,7 +56,7 @@ class YoloDetector:
 
 
 if __name__ == "__main__":
-    weights = sys.argv[1] if len(sys.argv) > 1 else "./yolo/runs/badge_detector/weights/best.pt"
+    weights = sys.argv[1] if len(sys.argv) > 1 else "yolo/yolov8n.pt"
     mode = sys.argv[2] if len(sys.argv) > 2 else "image"
 
     detector = YoloDetector(weights)
