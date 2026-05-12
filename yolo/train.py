@@ -128,7 +128,7 @@ def train(
 if __name__ == "__main__":
     import glob
 
-    dataset_dirs = [p.rstrip("/\\") for p in glob.glob("./dataset/*/")]
+    dataset_dirs = [p.rstrip("/\\") for p in glob.glob("./dataset/dataset/*/")]
     print(f"Найдено датасетов: {len(dataset_dirs)}")
     if dataset_dirs:
         print("  " + "\n  ".join(dataset_dirs[:5]) + ("..." if len(dataset_dirs) > 5 else ""))
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     best_weights = train(
         data_yaml=data_yaml,
         model_size="n",
-        epochs=10,
+        epochs=20,
         imgsz=480,
         batch=4,
     )
