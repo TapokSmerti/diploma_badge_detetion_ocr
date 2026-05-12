@@ -1,7 +1,8 @@
 ﻿__pycache__/
 *.pyc
 *venv/
-taks.txt
+tasks.txt
 dataset/*
 !dataset/datasets.txt
 !dataset/roboflow_scraper.py
+runs/*

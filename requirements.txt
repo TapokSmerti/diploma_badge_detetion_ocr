@@ -1,1 +1,15 @@
+# Датасеты
 roboflow
+
+# CV и ML
+opencv-python
+scikit-learn
+numpy
+joblib
+
+# YOLOv8
+ultralytics
+
+# Опционально — ускорение HOG (если есть GPU)
+# torch>=2.0
+# torchvision>=0.15
