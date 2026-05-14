@@ -5,4 +5,6 @@ tasks.txt
 dataset/*
 !dataset/datasets.txt
 !dataset/roboflow_scraper.py
+!dataset/negatives_scraper.py
+!dataset/relabel_negatives.py
 runs/*
