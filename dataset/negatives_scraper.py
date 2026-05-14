@@ -122,11 +122,6 @@ def download_coco_val(out_dir: Path = OUTPUT_DIR / "coco"):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def download_inria(out_dir: Path = OUTPUT_DIR / "inria"):
-    """
-    INRIA Person Dataset — 1 832 фото людей.
-    Очень релевантно: люди в рамке, но без бейджей.
-    Размер ~200 MB.
-    """
     print("\n[2/3] INRIA Person Dataset")
 
     img_dir = out_dir / "images"
@@ -144,22 +139,31 @@ def download_inria(out_dir: Path = OUTPUT_DIR / "inria"):
     )
 
     extract_tar(archive, out_dir)
-    archive.unlink()
 
     # Собираем все изображения из train и test в одну папку
     img_dir.mkdir(exist_ok=True)
     count = 0
+    skipped = 0
     raw_root = out_dir / "INRIAPerson"
     for img_path in raw_root.rglob("*.png"):
         if "annotations" in str(img_path).lower():
             continue
         dest = img_dir / f"inria_{count:05d}{img_path.suffix}"
-        shutil.copy2(img_path, dest)
-        count += 1
+        try:
+            shutil.copy2(img_path, dest)
+            count += 1
+        except PermissionError:
+            skipped += 1
+            continue
 
-    print(f"  ✅ INRIA: {count} изображений → {img_dir}")
+    # Удаляем архив только после успешного копирования
+    try:
+        archive.unlink()
+    except Exception:
+        pass
+
+    print(f"  ✅ INRIA: {count} изображений → {img_dir} (пропущено: {skipped})")
     return img_dir
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. Open Images v7 — выборка по категориям
