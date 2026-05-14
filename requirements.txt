@@ -1,5 +1,8 @@
 # Датасеты
 roboflow
+gdown
+fiftyone
+openimages
 
 # CV и ML
 opencv-python
@@ -13,3 +16,5 @@ ultralytics
 # Опционально — ускорение HOG (если есть GPU)
 # torch>=2.0
 # torchvision>=0.15
+
+tqdm

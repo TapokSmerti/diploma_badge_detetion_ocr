@@ -113,6 +113,12 @@ def train(
         val=True,
         verbose=True,
         exist_ok=True,
+        degrees=30,       
+        fliplr=0.5,
+        flipud=0.1,       
+        scale=0.3,        
+        shear=5.0,        
+        perspective=0.001 
     )
 
     best_weights = Path(project) / name / "weights" / "best.pt"
