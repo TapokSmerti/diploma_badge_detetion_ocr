@@ -62,7 +62,7 @@ def train(
 
 if __name__ == "__main__":
     ROOT = Path(__file__).resolve().parent.parent
-    data_yaml = ROOT / "datasets" / "dataset_merged" / "data.yaml"
+    data_yaml = ROOT / "dataset" / "dataset_merged" / "data.yaml"
 
     if not Path(data_yaml).exists():
         print(f"❌ data.yaml не найден: {data_yaml}")
