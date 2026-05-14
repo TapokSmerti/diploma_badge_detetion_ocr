@@ -22,7 +22,7 @@ dataset_merged/
 import shutil
 from pathlib import Path
 from collections import Counter
-
+from typing import Optional
 
 BADGES_DIR = Path("./badges")
 NEGATIVES_DIR = Path("./hard_negatives")
@@ -43,7 +43,7 @@ def is_image(path: Path) -> bool:
 
 def copy_image_and_label(
     img_path: Path,
-    lbl_path: Path | None,
+    lbl_path: Optional[Path],
     dst_img_dir: Path,
     dst_lbl_dir: Path,
     prefix: str,
