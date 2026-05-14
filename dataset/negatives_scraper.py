@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 
 
-OUTPUT_DIR = Path("./negatives")
+OUTPUT_DIR = Path("./negatives_source")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
@@ -52,10 +52,30 @@ def extract_zip(archive: Path, out_dir: Path):
         z.extractall(out_dir)
 
 
+def sanitize_name(name: str) -> str:
+    """Убирает символы недопустимые в Windows из имён файлов."""
+    invalid = r'<>:"/\|?*'
+    for ch in invalid:
+        name = name.replace(ch, "_")
+    return name
+
+
 def extract_tar(archive: Path, out_dir: Path):
     print(f"  Распаковываю {archive.name} → {out_dir.name}/")
+    out_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive) as t:
-        t.extractall(out_dir)
+        for member in t.getmembers():
+            # Чистим имя каждого файла/папки в пути
+            parts = Path(member.name).parts
+            clean_parts = [sanitize_name(p) for p in parts]
+            member.name = str(Path(*clean_parts)) if clean_parts else member.name
+            try:
+                t.extract(member, out_dir, filter="data")
+            except TypeError:
+                # filter= появился в Python 3.12, для старых версий без него
+                t.extract(member, out_dir)
+            except Exception as e:
+                pass  # пропускаем проблемный файл, продолжаем
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -187,6 +207,10 @@ def download_open_images_subset(
 
     try:
         from openimages.download import download_images
+        # exclusions_path обязателен в новых версиях openimages
+        excl_file = out_dir / 'exclusions.txt'
+        excl_file.write_text('')  # пустой = ничего не исключаем
+
         for cat in categories:
             cat_dir = img_dir / cat.replace(" ", "_").lower()
             if cat_dir.exists() and len(list(cat_dir.glob("*.jpg"))) > 10:
@@ -197,10 +221,10 @@ def download_open_images_subset(
                 download_images(
                     str(cat_dir),
                     [cat],
+                    exclusions_path=str(out_dir / 'exclusions.txt'),
                     limit=max_images,
-                    exclude_depictions=True,
                 )
-                n = len(list(cat_dir.glob("*.jpg")))
+                n = len(list(cat_dir.rglob("*.jpg")))
                 print(f"  ✅ {cat}: {n} фото")
             except Exception as e:
                 print(f"  ⚠️  {cat}: {e}")
