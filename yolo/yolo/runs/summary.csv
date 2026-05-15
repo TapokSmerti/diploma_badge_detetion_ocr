@@ -1,0 +1,10 @@
+name,model,status,mAP50,mAP50_95,precision,recall,elapsed_min,best_pt
+yolov5n,yolov5nu.pt,ok,0.8064,0.4496,0.8156,0.7401,54.1,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolov5n/weights/best.pt
+yolov5s,yolov5su.pt,ok,0.8210,0.4696,0.8683,0.7263,57.0,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolov5s/weights/best.pt
+yolov5m,yolov5mu.pt,ok,0.8303,0.4829,0.8463,0.7627,63.3,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolov5m/weights/best.pt
+yolov8n,yolov8n.pt,ok,0.8183,0.4667,0.8613,0.7362,55.0,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolov8n/weights/best.pt
+yolov8s,yolov8s.pt,ok,0.8382,0.4974,0.8528,0.7807,58.7,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolov8s/weights/best.pt
+yolov8m,yolov8m.pt,ok,0.8404,0.5062,0.8617,0.7656,66.3,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolov8m/weights/best.pt
+yolo11n,yolo11n.pt,ok,0.8350,0.4958,0.8547,0.7648,60.6,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolo11n/weights/best.pt
+yolo11s,yolo11s.pt,ok,0.8328,0.5051,0.8380,0.7670,63.7,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolo11s/weights/best.pt
+yolo11m,yolo11m.pt,ok,0.8050,0.4765,0.8227,0.7341,73.6,/home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/yolo/runs/detect/yolo/runs/yolo11m/weights/best.pt
