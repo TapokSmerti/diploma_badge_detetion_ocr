@@ -1,0 +1,90 @@
+# ============================================================
+# Конфигурация экспериментов для сравнения версий YOLO
+# Запуск: python yolo/train.py --config yolo/experiments.yaml
+# ============================================================
+
+# --- Общие параметры датасета ---
+data:
+  yaml: "../dataset/dataset_merged/data.yaml"
+
+# --- Общие гиперпараметры (применяются ко всем экспериментам если не переопределены) ---
+defaults:
+  epochs:      50
+  imgsz:       640
+  batch:       16
+  patience:    15
+  workers:     8
+  pretrained:  true
+  device:      ""          # "" = авто, "0" = GPU 0, "cpu" = CPU
+
+  # Аугментация
+  degrees:     90.0
+  fliplr:      0.5
+  flipud:      0.5
+  scale:       0.5
+  shear:       5.0
+  mixup:       0.5
+  copy_paste:  0.5
+  perspective: 0.001
+  hsv_h:       0.015
+  hsv_s:       0.7
+  hsv_v:       0.4
+
+# --- Список экспериментов ---
+# Каждый наследует defaults и может переопределить любой параметр
+experiments:
+
+  # ── YOLOv5 (ultralytics-версия) ─────────────────────────
+  - name:   yolov5n
+    model:  yolov5nu.pt
+    epochs: 50
+
+  - name:   yolov5s
+    model:  yolov5su.pt
+    epochs: 50
+
+  - name:   yolov5m
+    model:  yolov5mu.pt
+    epochs: 50
+
+  # ── YOLOv8 ──────────────────────────────────────────────
+  - name:   yolov8n
+    model:  yolov8n.pt
+    epochs: 50
+
+  - name:   yolov8s
+    model:  yolov8s.pt
+    epochs: 50
+
+  - name:   yolov8m
+    model:  yolov8m.pt
+    epochs: 50
+
+  # ── YOLO11 ──────────────────────────────────────────────
+  - name:   yolo11n
+    model:  yolo11n.pt
+    epochs: 50
+
+  - name:   yolo11s
+    model:  yolo11s.pt
+    epochs: 50
+
+  - name:   yolo11m
+    model:  yolo11m.pt
+    epochs: 50
+
+  # ── YOLO12 ──────────────────────────────────────────────
+  # - name:   yolo12n
+  #   model:  yolo12n.pt
+  #   epochs: 50
+
+# --- Экспорт после обучения ---
+export:
+  enabled:  true
+  formats:
+    - onnx
+    - torchscript
+    # - engine    # TensorRT — только NVIDIA GPU + TensorRT SDK
+  onnx_opset: 17
+  simplify:   true
+  half:       false   # FP16 — только для GPU
