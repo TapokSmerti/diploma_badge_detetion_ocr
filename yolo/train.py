@@ -72,9 +72,9 @@ if __name__ == "__main__":
     best_weights = train(
         data_yaml=data_yaml,
         model_size="n",
-        epochs=20,
+        epochs=50,
         imgsz=480,
-        batch=4,
+        batch=16,
     )
 
     print(f"\nДетекция:")

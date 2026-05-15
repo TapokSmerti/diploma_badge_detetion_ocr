@@ -2,10 +2,10 @@ task: detect
 mode: train
 model: yolov8n.pt
 data: /home/lboyarsky/projects/diploma_project/diploma_badge_detetion_ocr/dataset/dataset_merged/data.yaml
-epochs: 20
+epochs: 50
 time: null
 patience: 15
-batch: 4
+batch: 16
 imgsz: 480
 save: true
 save_period: -1
