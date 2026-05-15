@@ -1,29 +1,25 @@
 """
-Параллельное обучение нескольких YOLO моделей на одном GPU.
+Параллельное обучение нескольких YOLO моделей.
 
-Каждый эксперимент запускается в отдельном процессе через multiprocessing.
-Волны: эксперименты группируются по max_parallel штук и запускаются пакетами.
+Каждая модель запускается как отдельный subprocess (не daemon),
+поэтому ultralytics может свободно использовать свой DataLoader multiprocessing.
 
 Запуск:
     python yolo/train_parallel.py
-    python yolo/train_parallel.py --config yolo/experiments.yaml --max-parallel 3
+    python yolo/train_parallel.py --max-parallel 3
     python yolo/train_parallel.py --only yolov8n yolov8s yolo11n
 """
 
 import argparse
-import multiprocessing as mp
-import os
+import subprocess
 import sys
 import time
-import traceback
+import json
+import os
 from pathlib import Path
 
 import yaml
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Утилиты конфига (те же что в train.py)
-# ──────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = Path(__file__).parent / "experiments.yaml"
 
@@ -35,16 +31,12 @@ TRAIN_PARAMS = {
     "box", "cls", "dfl", "close_mosaic", "mosaic", "erasing",
 }
 
-# Примерное потребление VRAM (GB) при batch=64, imgsz=640
-# Используется только для планирования волн — не влияет на обучение
-VRAM_ESTIMATE = {
-    "n": 3,   # nano
-    "s": 5,   # small
-    "m": 8,   # medium
-    "l": 14,  # large
-    "x": 20,  # xlarge
-}
+VRAM_ESTIMATE = {"n": 3, "s": 5, "m": 8, "l": 14, "x": 20}
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Конфиг
+# ──────────────────────────────────────────────────────────────────────────────
 
 def load_config(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
@@ -54,13 +46,10 @@ def load_config(path: Path) -> dict:
 def resolve_data_yaml(cfg: dict, config_path: Path) -> str:
     raw = cfg.get("data", {}).get("yaml", "")
     root = config_path.resolve().parent.parent
-    for candidate in [Path(raw), (root / raw).resolve(), Path(raw).resolve()]:
+    for candidate in [(root / raw).resolve(), Path(raw).resolve()]:
         if candidate.exists():
             return str(candidate)
-    raise FileNotFoundError(
-        f"data.yaml не найден: {raw}\n"
-        f"  Запусти merge_dataset.py"
-    )
+    raise FileNotFoundError(f"data.yaml не найден: {raw}\nЗапусти merge_dataset.py")
 
 
 def build_experiment(cfg: dict, exp: dict) -> dict:
@@ -68,188 +57,243 @@ def build_experiment(cfg: dict, exp: dict) -> dict:
 
 
 def estimate_vram(model_name: str) -> int:
-    """Оценивает потребление VRAM по суффиксу модели."""
+    stem = Path(model_name).stem.lower()
     for suffix, gb in VRAM_ESTIMATE.items():
-        # yolov8n.pt → 'n', yolo11s.pt → 's', etc.
-        stem = Path(model_name).stem.lower()
         if stem.endswith(suffix):
             return gb
-    return 6  # fallback
+    return 6
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Функция обучения — запускается в дочернем процессе
+# Worker-скрипт (запускается как subprocess)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _train_worker(
-    model_name: str,
-    run_name: str,
-    data_yaml: str,
-    params: dict,
-    project: str,
-    export_cfg: dict,
-    result_queue: mp.Queue,
-    gpu_id: int = 0,
-):
-    """Запускается в отдельном процессе. Результат кладёт в result_queue."""
-    # Изолируем GPU для этого процесса через env (на случай multi-GPU)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+# Этот код вставляется в начало каждого subprocess через -c
+WORKER_SCRIPT = '''
+import sys, json, time, os
+from pathlib import Path
 
-    # Перенаправляем stdout в файл чтобы не мешать выводу других процессов
-    log_dir = Path(project) / run_name
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "train.log"
+args    = json.loads(sys.argv[1])
+model_n = args["model"]
+run_n   = args["name"]
+data_y  = args["data_yaml"]
+params  = args["params"]
+project = args["project"]
+exp_cfg = args.get("export_cfg", {})
 
-    try:
-        from ultralytics import YOLO
-        import torch
+TRAIN_PARAMS = {
+    "epochs","imgsz","batch","patience","workers","device",
+    "pretrained","degrees","fliplr","flipud","scale","shear",
+    "mixup","copy_paste","perspective","hsv_h","hsv_s","hsv_v",
+    "lr0","lrf","momentum","weight_decay","warmup_epochs",
+    "box","cls","dfl","close_mosaic","mosaic","erasing",
+}
 
-        device = params.get("device", "0")
-        if device == "":
-            device = "0" if torch.cuda.is_available() else "cpu"
+try:
+    from ultralytics import YOLO
+    import torch
 
-        print(f"[{run_name}] Старт на device={device}, GPU mem free: "
-              f"{torch.cuda.mem_get_info(0)[0]/1e9:.1f}GB" if torch.cuda.is_available() else
-              f"[{run_name}] Старт на CPU", flush=True)
+    device = params.get("device", "0")
+    if device == "":
+        device = "0" if torch.cuda.is_available() else "cpu"
 
-        model = YOLO(model_name)
-        train_kwargs = {k: v for k, v in params.items() if k in TRAIN_PARAMS}
-        # device переопределяем — дочерний процесс всегда видит только свой GPU
-        train_kwargs["device"] = device
+    print(f"[{run_n}] device={device}  model={model_n}", flush=True)
 
-        t0 = time.time()
-        results = model.train(
-                    data=data_yaml,
-                    project=project,
-                    name=run_name,
-                    save=True,
-                    plots=True,       # ← графики results.png, PR_curve.png и др.
-                    val=True,
-                    verbose=True,     # прогресс виден в терминале
-                    exist_ok=True,
-                    **train_kwargs,
-                )
+    model = YOLO(model_n)
+    train_kwargs = {k: v for k, v in params.items() if k in TRAIN_PARAMS}
+    train_kwargs["device"] = device
 
-        elapsed = time.time() - t0
-        rd = results.results_dict if hasattr(results, "results_dict") else {}
-        metrics = {
-            "mAP50":     rd.get("metrics/mAP50(B)",    0.0),
-            "mAP50_95":  rd.get("metrics/mAP50-95(B)", 0.0),
-            "precision": rd.get("metrics/precision(B)", 0.0),
-            "recall":    rd.get("metrics/recall(B)",    0.0),
-        }
-        best_pt = str(Path(project) / run_name / "weights" / "best.pt")
+    t0 = time.time()
+    results = model.train(
+        data=data_y,
+        project=project,
+        name=run_n,
+        save=True,
+        plots=True,
+        val=True,
+        verbose=True,
+        exist_ok=True,
+        **train_kwargs,
+    )
+    elapsed = time.time() - t0
 
-        # Экспорт
-        exported = {}
-        if export_cfg and export_cfg.get("enabled") and Path(best_pt).exists():
+    rd = results.results_dict if hasattr(results, "results_dict") else {}
+    metrics = {
+        "mAP50":     rd.get("metrics/mAP50(B)",    0.0),
+        "mAP50_95":  rd.get("metrics/mAP50-95(B)", 0.0),
+        "precision": rd.get("metrics/precision(B)", 0.0),
+        "recall":    rd.get("metrics/recall(B)",    0.0),
+    }
+    best_pt = str(Path(project) / "detect" / project / run_n / "weights" / "best.pt")
+    # ultralytics может класть в разные места — ищем best.pt
+    for candidate in [
+        Path(project) / run_n / "weights" / "best.pt",
+        Path(project) / "detect" / project / run_n / "weights" / "best.pt",
+        Path(results.save_dir) / "weights" / "best.pt",
+    ]:
+        if candidate.exists():
+            best_pt = str(candidate)
+            break
+
+    # Экспорт
+    exported = {}
+    if exp_cfg.get("enabled") and Path(best_pt).exists():
+        exp_model = YOLO(best_pt)
+        for fmt in exp_cfg.get("formats", ["onnx"]):
             try:
-                exp_model = YOLO(best_pt)
-                for fmt in export_cfg.get("formats", ["onnx"]):
-                    kwargs = dict(format=fmt, imgsz=640,
-                                  simplify=export_cfg.get("simplify", True))
-                    if fmt == "onnx":
-                        kwargs["opset"] = export_cfg.get("onnx_opset", 17)
-                    path = exp_model.export(**kwargs)
-                    exported[fmt] = str(path)
+                kw = dict(format=fmt, imgsz=640, simplify=exp_cfg.get("simplify", True))
+                if fmt == "onnx":
+                    kw["opset"] = exp_cfg.get("onnx_opset", 17)
+                path = exp_model.export(**kw)
+                exported[fmt] = str(path)
+                print(f"[{run_n}] exported {fmt}: {path}", flush=True)
             except Exception as e:
-                exported["error"] = str(e)
+                exported[fmt] = f"ERROR: {e}"
 
-        result_queue.put({
-            "name": run_name, "model": model_name,
-            "status": "ok", "best_pt": best_pt,
-            "elapsed_min": elapsed / 60,
-            "metrics": metrics, "exported": exported,
-            "log": str(log_file),
-        })
-        print(f"[{run_name}] ✅ готово за {elapsed/60:.1f} мин  "
-              f"mAP50={metrics['mAP50']:.4f}", flush=True)
+    result = {
+        "name": run_n, "model": model_n, "status": "ok",
+        "best_pt": best_pt, "elapsed_min": elapsed / 60,
+        "metrics": metrics, "exported": exported,
+    }
+    print(f"__RESULT__:{json.dumps(result)}", flush=True)
 
-    except Exception as e:
-        tb = traceback.format_exc()
-        result_queue.put({
-            "name": run_name, "model": model_name,
-            "status": "error", "error": str(e), "traceback": tb,
+except Exception as e:
+    import traceback
+    result = {
+        "name": run_n, "model": model_n, "status": "error",
+        "error": str(e), "traceback": traceback.format_exc(),
+        "best_pt": "", "elapsed_min": 0,
+        "metrics": {"mAP50":0,"mAP50_95":0,"precision":0,"recall":0},
+        "exported": {},
+    }
+    print(f"__RESULT__:{json.dumps(result)}", flush=True)
+    sys.exit(1)
+'''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Запуск волны
+# ──────────────────────────────────────────────────────────────────────────────
+
+def launch_experiment(exp: dict, data_yaml: str, project: str,
+                      export_cfg: dict) -> subprocess.Popen:
+    """Запускает один эксперимент как отдельный subprocess."""
+    params = {k: v for k, v in exp.items() if k not in ("name", "model")}
+    payload = json.dumps({
+        "model":      exp["model"],
+        "name":       exp["name"],
+        "data_yaml":  data_yaml,
+        "params":     params,
+        "project":    project,
+        "export_cfg": export_cfg,
+    })
+    proc = subprocess.Popen(
+        [sys.executable, "-c", WORKER_SCRIPT, payload],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    return proc
+
+
+def collect_output(name: str, proc: subprocess.Popen) -> dict:
+    """Читает stdout процесса, выводит в терминал с префиксом, парсит результат."""
+    result = None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line.startswith("__RESULT__:"):
+            try:
+                result = json.loads(line[len("__RESULT__:"):])
+            except Exception:
+                pass
+        else:
+            print(f"[{name}] {line}", flush=True)
+    proc.wait()
+    if result is None:
+        result = {
+            "name": name, "model": "", "status": "error",
+            "error": f"Process exited with code {proc.returncode}, no result found",
             "best_pt": "", "elapsed_min": 0,
             "metrics": {"mAP50":0,"mAP50_95":0,"precision":0,"recall":0},
-            "exported": {}, "log": str(log_file),
-        })
-        print(f"[{run_name}] ❌ ошибка: {e}", flush=True)
+            "exported": {},
+        }
+    return result
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Планировщик волн
-# ──────────────────────────────────────────────────────────────────────────────
 
 def run_waves(experiments: list, data_yaml: str, project: str,
-              export_cfg: dict, max_parallel: int, total_vram: int, gpu_id: int) -> list:
-    """
-    Делит список экспериментов на волны по max_parallel и запускает их.
-    Волна = группа процессов которые стартуют одновременно и ждут завершения.
-    """
-    results = []
-    waves = [experiments[i:i+max_parallel] for i in range(0, len(experiments), max_parallel)]
+              export_cfg: dict, max_parallel: int, total_vram: int) -> list:
+    all_results = []
+    waves = [experiments[i:i+max_parallel]
+             for i in range(0, len(experiments), max_parallel)]
 
-    print(f"\nВсего экспериментов: {len(experiments)}")
-    print(f"Волн: {len(waves)} (по {max_parallel} параллельно)")
-    print(f"GPU: {gpu_id}  Доступно VRAM: ~{total_vram} GB\n")
+    print(f"\nЭкспериментов: {len(experiments)}  |  Волн: {len(waves)}  |  "
+          f"Параллельно: {max_parallel}  |  VRAM: ~{total_vram} GB\n")
 
-    for wave_idx, wave in enumerate(waves):
+    for wi, wave in enumerate(waves):
         est = sum(estimate_vram(e["model"]) for e in wave)
-        print(f"{'─'*55}")
-        print(f"Волна {wave_idx+1}/{len(waves)}: "
-              f"{[e['name'] for e in wave]}  (~{est} GB VRAM)")
-        print(f"{'─'*55}")
+        names = [e["name"] for e in wave]
+        print(f"{'─'*60}")
+        print(f"Волна {wi+1}/{len(waves)}: {names}  (~{est} GB VRAM)")
+        print(f"{'─'*60}")
 
-        q = mp.Queue()
-        procs = []
-
+        # Запускаем все процессы волны
+        procs = {}
         for exp in wave:
-            params = exp.copy()
-            p = mp.Process(
-                target=_train_worker,
-                args=(exp["model"], exp["name"], data_yaml, params,
-                      project, export_cfg, q, gpu_id),
-                daemon=True,
-            )
-            p.start()
-            procs.append(p)
-            # Небольшая задержка чтобы CUDA контексты не конфликтовали при инициализации
-            time.sleep(3)
+            proc = launch_experiment(exp, data_yaml, project, export_cfg)
+            procs[exp["name"]] = proc
+            time.sleep(2)  # небольшая пауза чтобы CUDA контексты не конфликтовали
 
-        # Ждём завершения всех процессов в волне
-        for p in procs:
-            p.join()
+        # Читаем вывод параллельно через потоки
+        import threading
+        results_wave = {}
 
-        # Собираем результаты
-        while not q.empty():
-            results.append(q.get())
+        def read_proc(name, proc):
+            results_wave[name] = collect_output(name, proc)
 
-    return results
+        threads = [
+            threading.Thread(target=read_proc, args=(name, proc), daemon=True)
+            for name, proc in procs.items()
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        for name in [e["name"] for e in wave]:
+            r = results_wave.get(name)
+            if r:
+                status = "✅" if r["status"] == "ok" else "❌"
+                m = r["metrics"]
+                print(f"\n{status} {name}: mAP50={m['mAP50']:.4f}  "
+                      f"P={m['precision']:.4f}  R={m['recall']:.4f}  "
+                      f"{r['elapsed_min']:.1f}м")
+                all_results.append(r)
+
+    return all_results
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Вывод итогов
+# Итоги
 # ──────────────────────────────────────────────────────────────────────────────
 
 def print_summary(results: list):
     print(f"\n{'='*70}")
-    print(f"{'Модель':<14} {'mAP50':>7} {'mAP50-95':>9} {'P':>7} {'R':>7} {'Время':>8} Статус")
+    print(f"{'Модель':<14} {'mAP50':>7} {'mAP50-95':>9} {'P':>7} {'R':>7} {'Время':>8}  Статус")
     print(f"{'─'*70}")
     for r in sorted(results, key=lambda x: x["metrics"]["mAP50"], reverse=True):
         m = r["metrics"]
-        status = "✅" if r["status"] == "ok" else "❌"
+        s = "✅" if r["status"] == "ok" else "❌"
         print(f"{r['name']:<14} {m['mAP50']:>7.4f} {m['mAP50_95']:>9.4f} "
               f"{m['precision']:>7.4f} {m['recall']:>7.4f} "
-              f"{r['elapsed_min']:>7.1f}м  {status}")
+              f"{r['elapsed_min']:>7.1f}м  {s}")
     print(f"{'='*70}")
 
     failed = [r for r in results if r["status"] == "error"]
     if failed:
-        print(f"\nПровалившиеся ({len(failed)}):")
+        print(f"\n❌ Провалилось: {len(failed)}")
         for r in failed:
-            print(f"  {r['name']}: {r.get('error','?')}")
-            print(f"  Лог: {r.get('log','')}")
+            print(f"  {r['name']}: {r.get('error', '?')}")
 
 
 def save_csv(results: list, out: str = "./yolo/runs/summary.csv"):
@@ -258,13 +302,13 @@ def save_csv(results: list, out: str = "./yolo/runs/summary.csv"):
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=[
             "name","model","status","mAP50","mAP50_95",
-            "precision","recall","elapsed_min","best_pt","log"
+            "precision","recall","elapsed_min","best_pt"
         ])
         w.writeheader()
         for r in results:
             w.writerow({
-                "name": r["name"], "model": r["model"], "status": r["status"],
-                "best_pt": r.get("best_pt",""), "log": r.get("log",""),
+                "name": r["name"], "model": r["model"],
+                "status": r["status"], "best_pt": r.get("best_pt",""),
                 "elapsed_min": f"{r['elapsed_min']:.1f}",
                 **{k: f"{v:.4f}" for k, v in r["metrics"].items()},
             })
@@ -280,20 +324,14 @@ def parse_args():
     p.add_argument("--config",       default=str(DEFAULT_CONFIG))
     p.add_argument("--only",         nargs="+", metavar="NAME")
     p.add_argument("--skip",         nargs="+", metavar="NAME")
-    p.add_argument("--max-parallel", type=int, default=3,
-                   help="Сколько моделей обучать одновременно (default: 3)")
-    p.add_argument("--total-vram",   type=int, default=48,
-                   help="Доступно VRAM в GB (default: 48 для RTX 6000 Ada)")
-    p.add_argument("--gpu",          type=int, default=0,
-                   help="Индекс GPU (default: 0)")
+    p.add_argument("--max-parallel", type=int, default=3)
+    p.add_argument("--total-vram",   type=int, default=48)
+    p.add_argument("--device",       help="Переопределить device для всех: 0, cpu, ...")
     p.add_argument("--no-export",    action="store_true")
     return p.parse_args()
 
 
 def main():
-    # ВАЖНО: на Windows multiprocessing требует этой защиты
-    mp.set_start_method("spawn", force=True)
-
     args = parse_args()
 
     config_path = Path(args.config)
@@ -301,9 +339,9 @@ def main():
         print(f"❌ Конфиг не найден: {config_path}")
         sys.exit(1)
 
-    cfg = load_config(config_path)
-    data_yaml = resolve_data_yaml(cfg, config_path)
-    project   = cfg.get("defaults", {}).get("project", "./yolo/runs")
+    cfg        = load_config(config_path)
+    data_yaml  = resolve_data_yaml(cfg, config_path)
+    project    = cfg.get("defaults", {}).get("project", "./yolo/runs")
     export_cfg = {} if args.no_export else cfg.get("export", {})
 
     experiments = cfg.get("experiments", [])
@@ -312,23 +350,18 @@ def main():
     if args.skip:
         experiments = [e for e in experiments if e["name"] not in args.skip]
 
-    if not experiments:
-        print("❌ Нет экспериментов для запуска")
-        sys.exit(1)
+    full = [build_experiment(cfg, e) for e in experiments]
+    if args.device:
+        for e in full:
+            e["device"] = args.device
 
-    # Строим полные параметры (defaults + exp)
-    full_experiments = [build_experiment(cfg, e) for e in experiments]
+    print(f"Конфиг:  {config_path}")
+    print(f"Датасет: {data_yaml}")
+    for e in full:
+        print(f"  • {e['name']}  ({e['model']})")
 
-    results = run_waves(
-        experiments=full_experiments,
-        data_yaml=data_yaml,
-        project=project,
-        export_cfg=export_cfg,
-        max_parallel=args.max_parallel,
-        total_vram=args.total_vram,
-        gpu_id=args.gpu,
-    )
-
+    results = run_waves(full, data_yaml, project, export_cfg,
+                        args.max_parallel, args.total_vram)
     print_summary(results)
     save_csv(results)
 
