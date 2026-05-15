@@ -42,11 +42,14 @@ def train(
         val=True,
         verbose=True,
         exist_ok=True,
-        degrees=30,       
+        workers=16,
+        degrees=90,       
         fliplr=0.5,
-        flipud=0.1,       
-        scale=0.3,        
-        shear=5.0,        
+        flipud=0.5,       
+        scale=0.5,        
+        shear=5.0,
+        mixup=0.5,
+        copy_paste=0.5,
         perspective=0.001 
     )
 
@@ -72,9 +75,9 @@ if __name__ == "__main__":
     best_weights = train(
         data_yaml=data_yaml,
         model_size="n",
-        epochs=50,
-        imgsz=480,
-        batch=16,
+        epochs=100,
+        imgsz=640,
+        batch=64,
     )
 
     print(f"\nДетекция:")
