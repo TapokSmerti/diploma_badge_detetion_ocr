@@ -9,11 +9,11 @@ data:
 
 # --- Общие гиперпараметры (применяются ко всем экспериментам если не переопределены) ---
 defaults:
-  epochs:      50
+  epochs:      100
   imgsz:       640
   batch:       16
   patience:    15
-  workers:     8
+  workers:     12
   pretrained:  true
   device:      ""          # "" = авто, "0" = GPU 0, "cpu" = CPU
 
@@ -60,6 +60,26 @@ experiments:
     model:  yolov8m.pt
     epochs: 50
 
+  # ── YOLOv9 ──────────────────────────────────────────────
+  - name:   yolov9n
+    model:  yolov9n.pt
+
+  - name:   yolov9s
+    model:  yolov9s.pt
+
+  - name:   yolov9m
+    model:  yolov9m.pt
+
+  # ── YOLOv10 ─────────────────────────────────────────────
+  - name:   yolov10n
+    model:  yolov10n.pt
+
+  - name:   yolov10s
+    model:  yolov10s.pt
+
+  - name:   yolov10m
+    model:  yolov10m.pt
+
   # ── YOLO11 ──────────────────────────────────────────────
   - name:   yolo11n
     model:  yolo11n.pt
@@ -74,10 +94,23 @@ experiments:
     epochs: 50
 
   # ── YOLO12 ──────────────────────────────────────────────
-  # - name:   yolo12n
-  #   model:  yolo12n.pt
-  #   epochs: 50
+  - name:   yolo12n
+    model:  yolo12n.pt
+    epochs: 50
 
+  - name:   yolo12s
+    model:  yolo12s.pt
+    epochs: 50
+
+  - name:   yolo12m
+    model:  yolo12m.pt
+    epochs: 50
+
+  # ── RT-DETR ─────────────────────────────────────────────
+  - name:   rtdetr_l
+    model:  rtdetr-l.pt
+    batch:  8
+    
 # --- Экспорт после обучения ---
 export:
   enabled:  true

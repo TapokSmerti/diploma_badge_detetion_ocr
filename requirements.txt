@@ -13,8 +13,13 @@ joblib
 # YOLOv8
 ultralytics
 
-# Опционально — ускорение HOG (если есть GPU)
-# torch>=2.0
-# torchvision>=0.15
+# Ускорение (GPU)
+# --index-url https://download.pytorch.org/whl/cu118
+torch
+torchvision
 
+# ONNX Runtime (отдельно, без спец. индекса)
+onnxruntime-gpu
+
+# Прогресс-бары
 tqdm
