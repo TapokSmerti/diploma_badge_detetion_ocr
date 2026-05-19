@@ -14,7 +14,6 @@ joblib
 ultralytics
 
 # Ускорение (GPU)
-# --index-url https://download.pytorch.org/whl/cu118
 torch
 torchvision
 
@@ -23,3 +22,54 @@ onnxruntime-gpu
 
 # Прогресс-бары
 tqdm
+
+# Web сервер
+fastapi
+uvicorn[standard]
+python-multipart
+
+# WebSocket поддержка (опционально, для низкой задержки)
+websockets
+python-socketio
+
+# Асинхронность и HTTP клиенты
+aiofiles
+httpx
+
+# Шаблоны (если нужно больше HTML)
+jinja2
+
+# Обработка изображений
+Pillow
+imageio
+
+# Визуализация и логирование
+tensorboard
+matplotlib
+seaborn
+
+# Дополнительные утилиты
+pandas
+pyyaml
+requests
+colorama
+
+# Для TorchScript (если нужно)
+torchsummary
+
+# Для ONNX оптимизации
+onnx
+onnxoptimizer
+
+# Для TensorRT (если будете использовать)
+# tensorrt  # Требует отдельной установки от NVIDIA
+
+# Мониторинг и отладка
+psutil
+rich  # Красивые логи в консоль
+
+# Аутентификация (если понадобится)
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+
