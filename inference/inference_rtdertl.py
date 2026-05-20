@@ -47,7 +47,7 @@ def export_detections_to_cvat(
         },
         "images": [],
         "annotations": [],
-        "categories": [{"id": 0, "name": "badge"}]
+        "categories": [{"id": 1, "name": "badge"}]
     }
     
     # Инференс
@@ -83,7 +83,7 @@ def export_detections_to_cvat(
                 coco_data["annotations"].append({
                     "id": ann_id,
                     "image_id": frame_idx,
-                    "category_id": 0,
+                    "category_id": 1,
                     "bbox": [float(x1), float(y1), float(x2-x1), float(y2-y1)],
                     "area": float((x2-x1) * (y2-y1)),
                     "score": float(conf),
