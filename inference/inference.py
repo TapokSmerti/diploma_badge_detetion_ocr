@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+
 """
 Бенчмаркинг YOLO-моделей в форматах pt, onnx, torchscript.
 Запускает модели последовательно (GPU не любит параллельные контексты),
 но собирает результаты быстро благодаря правильному замеру времени.
 """
-
+from __future__ import annotations
 import os
 import sys
 import time
@@ -13,6 +13,7 @@ import gc
 import csv
 from pathlib import Path
 from datetime import datetime
+from typing import List, Dict, Optional, Any
 
 import torch
 import numpy as np
@@ -47,6 +48,10 @@ def find_all_models(models_root: str) -> list[dict]:
 
     for model_file in sorted(root_path.rglob("*")):
         if model_file.suffix not in {".pt", ".onnx", ".torchscript"}:
+            continue
+        
+        stem = model_file.stem
+        if stem != "best":
             continue
 
         # Берём имя родительской папки модели (yolov8n, yolo11s, ...)
