@@ -10,7 +10,6 @@ with zipfile.ZipFile(zip_path, 'w') as zipf:
             weights_file = model_dir / "weights" / "best.pt"
             if weights_file.exists():
                 zipf.write(weights_file, f"{model_dir.name}_best.pt")
-                print(f"Добавле�el_dir.name}")
+                print(f"Added: {model_dir.name}")
 
-print(f"Готово! Архив: {zip_path}")
-
+print(f"Done! Archive: {zip_path}")
