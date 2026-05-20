@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Бенчмаркинг 17 моделей в 3 форматах (pt, onnx, torchscript)
-С выводом времени ожидания и прогресса в консоль
+Бенчмаркинг YOLO-моделей в форматах pt, onnx, torchscript.
+Запускает модели последовательно (GPU не любит параллельные контексты),
+но собирает результаты быстро благодаря правильному замеру времени.
 """
 
 import os
@@ -11,11 +12,7 @@ import json
 import gc
 import csv
 from pathlib import Path
-from datetime import datetime, timedelta
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import threading
-import multiprocessing as mp
+from datetime import datetime
 
 import torch
 import numpy as np
@@ -23,381 +20,317 @@ import psutil
 from ultralytics import YOLO
 import cv2
 
+
 # ========== КОНФИГУРАЦИЯ ==========
-VIDEO_PATH = "../dataset/downloaded_videos/vid1.mp4"  # Укажи путь к тестовому видео
-MODELS_ROOT = "../yolo/runs/detect/yolo/runs"  # Корневая папка со всеми моделями (17 папок)
-OUTPUT_DIR = "./benchmark_results"  # Куда сохранять результаты
-SAVE_OUTPUT_VIDEOS = True  # Сохранять видео с детекциями для каждой модели
+VIDEO_PATH = "../dataset/downloaded_videos/test_vids/vid1.mp4"
+MODELS_ROOT = "../yolo/runs/detect/yolo/runs"
+OUTPUT_DIR = "./benchmark_results"
 CONF_THRESHOLD = 0.5
 IOU_THRESHOLD = 0.45
-PARALLEL_MODELS = 8  # Количество моделей, запускаемых параллельно (настрой под свой GPU)
+WARMUP_FRAMES = 5   # кадров для прогрева модели перед замером
 # ==================================
 
-# Глобальные счётчики для прогресса
-completed_count = 0
-total_count = 0
-progress_lock = threading.Lock()
 
-
-def format_time(seconds):
-    """Форматирует время в читаемый вид"""
+def format_time(seconds: float) -> str:
     if seconds < 60:
-        return f"{seconds:.1f} сек"
+        return f"{seconds:.1f}с"
     elif seconds < 3600:
-        minutes = seconds / 60
-        return f"{minutes:.1f} мин"
+        return f"{seconds / 60:.1f}мин"
     else:
-        hours = seconds / 3600
-        return f"{hours:.1f} ч"
+        return f"{seconds / 3600:.1f}ч"
 
 
-def estimate_inference_time(model_path: str, video_path: str, num_test_frames: int = 30) -> float:
-    """
-    Быстро оценивает время инференса на небольшом количестве кадров
-    Возвращает预估 полное время в секундах
-    """
+def find_all_models(models_root: str) -> list[dict]:
+    """Находит все модели в форматах pt, onnx, torchscript."""
+    models = []
+    root_path = Path(models_root)
+
+    for model_file in sorted(root_path.rglob("*")):
+        if model_file.suffix not in {".pt", ".onnx", ".torchscript"}:
+            continue
+
+        # Берём имя родительской папки модели (yolov8n, yolo11s, ...)
+        # Структура: runs/<model_name>/weights/best.pt
+        parts = model_file.parts
+        try:
+            runs_idx = parts.index(root_path.name)
+            model_name = parts[runs_idx + 1]
+        except (ValueError, IndexError):
+            model_name = model_file.parent.parent.name
+
+        models.append({
+            "path": str(model_file),
+            "format": model_file.suffix[1:],  # без точки
+            "name": model_name,
+            "size_mb": model_file.stat().st_size / 1024 / 1024,
+        })
+
+    return models
+
+
+def check_onnx_cuda() -> bool:
+    """Проверяет, доступен ли CUDA для ONNX Runtime."""
     try:
-        # Загружаем модель
-        model = YOLO(model_path)
-        
-        # Открываем видео и получаем общее количество кадров
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        
-        # Тестируем на первых N кадрах
-        test_times = []
-        frame_count = 0
-        
-        for result in model(video_path, stream=True, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, verbose=False):
-            if frame_count >= num_test_frames:
-                break
-            
-            start_time = time.perf_counter()
-            # Просто ждём завершения кадра (он уже обработан в result)
-            frame_time = (time.perf_counter() - start_time) * 1000
-            test_times.append(frame_time)
-            frame_count += 1
-        
-        if test_times:
-            avg_time_per_frame_ms = np.mean(test_times)
-            estimated_total_seconds = (avg_time_per_frame_ms * total_frames) / 1000
-            return estimated_total_seconds
-        else:
-            return 0
-    
-    except Exception as e:
-        print(f"  ⚠️ Ошибка оценки времени: {e}")
-        return 0
+        import onnxruntime as ort
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except ImportError:
+        return False
 
 
-def inference_worker(model_info: dict, video_path: str, output_dir: str, worker_id: int):
+def run_model(model_info: dict, video_path: str) -> dict:
     """
-    Запускает инференс для одной модели (работает в отдельном процессе)
+    Запускает инференс одной модели и возвращает метрики.
+    Работает в основном процессе — GPU эффективнее при одном контексте.
     """
-    global completed_count, total_count
-    
-    model_path = model_info['path']
-    model_format = model_info['format']
-    model_name = model_info['name']
-    
-    start_total = time.time()
-    
+    model_path = model_info["path"]
+    model_format = model_info["format"]
+    model_name = model_info["name"]
+
+    print(f"\n{'─'*60}")
+    print(f"▶ {model_name} [{model_format.upper()}]  {model_info['size_mb']:.1f} MB")
+
+    # ONNX без CUDA-провайдера — пропускаем, не тратим время
+    if model_format == "onnx" and not check_onnx_cuda():
+        print("  ⚠ ONNX CUDA недоступен (нужна libcublasLt.so.11, проверь версию CUDA/onnxruntime)")
+        print("  → Пропускаем модель")
+        return {
+            "model_name": model_name,
+            "format": model_format,
+            "skipped": True,
+            "skip_reason": "ONNX CUDA unavailable",
+            "timestamp": datetime.now().isoformat(),
+        }
+
     try:
-        print(f"\n[Воркер {worker_id}] 🔄 Загрузка: {model_name} ({model_format})")
-        
-        # Замеряем память до загрузки
-        torch.cuda.reset_peak_memory_stats()
+        # --- Загрузка ---
         torch.cuda.empty_cache()
         gc.collect()
-        
+
         ram_before = psutil.Process().memory_info().rss / 1024 / 1024
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         vram_before = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
-        
-        # Загружаем модель
-        load_start = time.perf_counter()
+
+        t_load = time.perf_counter()
         model = YOLO(model_path)
-        load_time_ms = (time.perf_counter() - load_start) * 1000
-        
+        load_ms = (time.perf_counter() - t_load) * 1000
+
         ram_after = psutil.Process().memory_info().rss / 1024 / 1024
         vram_after = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
-        
-        print(f"[Воркер {worker_id}] ✅ Модель загружена за {load_time_ms:.0f}ms "
-              f"(VRAM: {vram_after - vram_before:.1f}MB)")
-        
-        # Запускаем инференс
-        print(f"[Воркер {worker_id}] 🎬 Запуск инференса на видео...")
-        
-        # Переменные для замеров
-        frame_times = []
-        frame_count = 0
-        
-        # Получаем общее количество кадров для прогресса
+        print(f"  Загрузка: {load_ms:.0f}ms  |  VRAM δ: {vram_after - vram_before:+.1f}MB")
+
+        # --- Прогрев ---
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-        
-        inference_start = time.perf_counter()
-        
-        # Инференс с прогрессом
-        last_print_time = time.time()
-        
-        for result in model(video_path, stream=True, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, verbose=False):
-            frame_start = time.perf_counter()
-            
-            frame_time = (time.perf_counter() - frame_start) * 1000
-            frame_times.append(frame_time)
+
+        print(f"  Прогрев ({WARMUP_FRAMES} кадров)...", end=" ", flush=True)
+        warmup_done = 0
+        for _ in model(video_path, stream=True, conf=CONF_THRESHOLD,
+                       iou=IOU_THRESHOLD, verbose=False):
+            warmup_done += 1
+            if warmup_done >= WARMUP_FRAMES:
+                break
+        print("готово")
+
+        # --- Инференс ---
+        print(f"  Инференс ({total_frames} кадров)...")
+        frame_times_ms: list[float] = []
+        frame_count = 0
+        last_report = time.time()
+        t_inference_start = time.time()  # используем time.time() везде для единообразия
+
+        for result in model(video_path, stream=True, conf=CONF_THRESHOLD,
+                            iou=IOU_THRESHOLD, verbose=False):
+            # Правильный способ замерить время одного кадра — через speed из result
+            # result.speed = {"preprocess": ms, "inference": ms, "postprocess": ms}
+            spd = result.speed
+            frame_ms = spd.get("preprocess", 0) + spd.get("inference", 0) + spd.get("postprocess", 0)
+            frame_times_ms.append(frame_ms)
             frame_count += 1
-            
-            # Печатаем прогресс каждые 5 секунд
-            current_time = time.time()
-            if current_time - last_print_time >= 5:
-                progress = (frame_count / total_frames) * 100
-                elapsed = current_time - inference_start
-                eta = (elapsed / frame_count) * (total_frames - frame_count) if frame_count > 0 else 0
-                
-                print(f"[Воркер {worker_id}] 📊 {model_name}: {progress:.1f}% "
-                      f"({frame_count}/{total_frames} кадров) | "
-                      f"Прошло: {format_time(elapsed)} | "
-                      f"Осталось: {format_time(eta)}")
-                last_print_time = current_time
-        
-        total_time = time.perf_counter() - inference_start
+
+            now = time.time()
+            if now - last_report >= 5.0:
+                elapsed = now - t_inference_start
+                fps_so_far = frame_count / elapsed if elapsed > 0 else 0
+                eta = (total_frames - frame_count) / fps_so_far if fps_so_far > 0 else 0
+                pct = 100 * frame_count / total_frames
+                print(f"    {pct:5.1f}%  {frame_count}/{total_frames}  "
+                      f"{fps_so_far:.1f} FPS  осталось ~{format_time(eta)}")
+                last_report = now
+
+        total_time = time.time() - t_inference_start
         fps = frame_count / total_time if total_time > 0 else 0
-        
-        # Замеряем память после инференса
         vram_peak = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
-        
-        # Собираем метрики
+
+        arr = np.array(frame_times_ms) if frame_times_ms else np.array([0.0])
         metrics = {
             "model_name": model_name,
             "format": model_format,
             "model_path": model_path,
-            "model_size_mb": model_info['size_mb'],
-            "load_time_ms": load_time_ms,
+            "model_size_mb": round(model_info["size_mb"], 2),
+            "load_time_ms": round(load_ms, 1),
             "total_frames": frame_count,
-            "total_time_seconds": total_time,
-            "fps": fps,
-            "inference_time_avg_ms": np.mean(frame_times) if frame_times else 0,
-            "inference_time_p50_ms": np.percentile(frame_times, 50) if frame_times else 0,
-            "inference_time_p95_ms": np.percentile(frame_times, 95) if frame_times else 0,
-            "inference_time_p99_ms": np.percentile(frame_times, 99) if frame_times else 0,
-            "vram_peak_mb": vram_peak,
-            "ram_used_mb": ram_after - ram_before,
-            "timestamp": datetime.now().isoformat()
+            "total_time_seconds": round(total_time, 2),
+            "fps": round(fps, 2),
+            "frame_time_avg_ms": round(float(np.mean(arr)), 2),
+            "frame_time_p50_ms": round(float(np.percentile(arr, 50)), 2),
+            "frame_time_p95_ms": round(float(np.percentile(arr, 95)), 2),
+            "frame_time_p99_ms": round(float(np.percentile(arr, 99)), 2),
+            "vram_peak_mb": round(vram_peak, 1),
+            "ram_delta_mb": round(ram_after - ram_before, 1),
+            "timestamp": datetime.now().isoformat(),
         }
-        
-        total_elapsed = time.time() - start_total
-        print(f"[Воркер {worker_id}] ✅ {model_name} ({model_format}) - "
-              f"FPS: {fps:.1f} | Время: {format_time(total_time)} | "
-              f"Всего: {format_time(total_elapsed)}")
-        
+
+        print(f"  ✓ FPS: {fps:.1f}  |  avg: {metrics['frame_time_avg_ms']}ms  "
+              f"|  p95: {metrics['frame_time_p95_ms']}ms  "
+              f"|  VRAM peak: {vram_peak:.0f}MB")
         return metrics
-    
+
     except Exception as e:
-        print(f"[Воркер {worker_id}] ❌ Ошибка {model_name}: {e}")
+        print(f"  ✗ Ошибка: {e}")
         return {
             "model_name": model_name,
             "format": model_format,
             "error": str(e),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
         }
-    
+
     finally:
-        with progress_lock:
-            completed_count += 1
-            remaining = total_count - completed_count
-            if remaining > 0:
-                print(f"\n📈 Общий прогресс: {completed_count}/{total_count} моделей завершено. "
-                      f"Осталось: {remaining}")
+        # Явно освобождаем модель перед следующей
+        try:
+            del model
+        except NameError:
+            pass
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
-def estimate_all_models(models: list, video_path: str) -> dict:
-    """Оценивает время выполнения для всех моделей"""
-    print("\n" + "=" * 60)
-    print("🔮 Оценка времени выполнения...")
-    print("=" * 60)
-    
-    estimations = {}
-    total_estimated = 0
-    
-    for i, model in enumerate(models):
-        print(f"  Оценка {i+1}/{len(models)}: {model['name']} ({model['format']})...", end=" ", flush=True)
-        est_time = estimate_inference_time(model['path'], video_path, num_test_frames=20)
-        estimations[f"{model['name']}_{model['format']}"] = est_time
-        total_estimated += est_time
-        print(f"~{format_time(est_time)}")
-    
-    # С учётом параллельности
-    parallel_time = total_estimated / PARALLEL_MODELS if PARALLEL_MODELS > 0 else total_estimated
-    
-    print("\n" + "=" * 60)
-    print("📊 Оценка времени (приблизительная):")
-    print(f"  Последовательно: ~{format_time(total_estimated)}")
-    print(f"  Параллельно ({PARALLEL_MODELS} процессов): ~{format_time(parallel_time)}")
-    print("=" * 60)
-    
-    return estimations
+def save_results(results: list[dict], output_dir: str) -> None:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # JSON — всё включая ошибки и пропуски
+    json_path = out / f"benchmark_{ts}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\n📄 JSON: {json_path}")
 
-def find_all_models(models_root: str):
-    """Находит все модели в форматах pt, onnx, torchscript"""
-    models = []
-    root_path = Path(models_root)
-    
-    for model_file in root_path.rglob("*"):
-        if model_file.suffix in [".pt", ".onnx", ".torchscript"]:
-            # Пытаемся извлечь имя модели из пути
-            model_name = model_file.parent.name if model_file.parent != root_path else model_file.stem
-            models.append({
-                "path": str(model_file),
-                "format": model_file.suffix[1:],
-                "name": model_name,
-                "size_mb": model_file.stat().st_size / (1024 * 1024)
-            })
-    
-    return models
+    # CSV — только успешные
+    successful = [r for r in results if "fps" in r]
+    if not successful:
+        print("  Нет успешных результатов для CSV")
+        return
 
+    csv_path = out / f"benchmark_{ts}.csv"
+    fields = [
+        "model_name", "format", "model_size_mb", "load_time_ms",
+        "fps", "total_time_seconds", "frame_time_avg_ms",
+        "frame_time_p50_ms", "frame_time_p95_ms", "frame_time_p99_ms",
+        "vram_peak_mb", "ram_delta_mb", "total_frames",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(successful)
+    print(f"📊 CSV:  {csv_path}")
 
-def run_benchmark_parallel(models: list, video_path: str, output_dir: str, max_workers: int):
-    """Запускает бенчмаркинг параллельно"""
-    global completed_count, total_count
-    
-    total_count = len(models)
-    completed_count = 0
-    
-    print("\n" + "=" * 60)
-    print(f"🚀 Запуск бенчмаркинга {len(models)} моделей")
-    print(f"   Параллельных процессов: {max_workers}")
-    print(f"   Видео: {video_path}")
-    print("=" * 60)
-    
-    results = []
-    start_time = time.time()
-    
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Запускаем все задачи
-        futures = {}
-        for i, model in enumerate(models):
-            future = executor.submit(inference_worker, model, video_path, output_dir, i)
-            futures[future] = model
-        
-        # Собираем результаты по мере завершения
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-    
-    total_elapsed = time.time() - start_time
-    print("\n" + "=" * 60)
-    print(f"✅ Бенчмаркинг завершён за {format_time(total_elapsed)}")
-    print("=" * 60)
-    
-    return results
+    # Таблица в консоль
+    print(f"\n{'═'*80}")
+    print("РЕЗУЛЬТАТЫ  (сортировка по FPS ↓)")
+    print(f"{'═'*80}")
+    header = f"{'Модель':<20} {'Формат':<12} {'FPS':>7} {'avg ms':>8} {'p95 ms':>8} {'VRAM MB':>8} {'Размер':>8}"
+    print(header)
+    print("─" * 80)
 
+    for r in sorted(successful, key=lambda x: x["fps"], reverse=True):
+        print(
+            f"{r['model_name'][:20]:<20} {r['format']:<12} "
+            f"{r['fps']:>7.1f} {r['frame_time_avg_ms']:>8.1f} "
+            f"{r['frame_time_p95_ms']:>8.1f} {r['vram_peak_mb']:>8.0f} "
+            f"{r['model_size_mb']:>7.1f}M"
+        )
 
-def save_results(results: list, output_dir: str):
-    """Сохраняет результаты в JSON и CSV"""
-    
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Сохраняем JSON
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    json_path = output_dir / f"benchmark_{timestamp}.json"
-    with open(json_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\n📄 JSON сохранён: {json_path}")
-    
-    # Сохраняем CSV
-    csv_path = output_dir / f"benchmark_{timestamp}.csv"
-    successful = [r for r in results if 'error' not in r]
-    
-    if successful:
-        fieldnames = ['model_name', 'format', 'model_size_mb', 'load_time_ms', 'fps',
-                     'total_time_seconds', 'inference_time_avg_ms', 'inference_time_p95_ms',
-                     'vram_peak_mb', 'ram_used_mb', 'total_frames']
-        
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for r in successful:
-                row = {k: r.get(k, '') for k in fieldnames}
-                writer.writerow(row)
-        print(f"📊 CSV сохранён: {csv_path}")
-    
-    # Выводим таблицу результатов в консоль
-    print("\n" + "=" * 80)
-    print("📈 РЕЗУЛЬТАТЫ БЕНЧМАРКИНГА")
-    print("=" * 80)
-    print(f"{'Модель':<30} {'Формат':<10} {'FPS':>8} {'Время':>10} {'VRAM':>10} {'Загрузка':>10}")
-    print("-" * 80)
-    
-    for r in sorted(successful, key=lambda x: x['fps'], reverse=True):
-        print(f"{r['model_name'][:28]:<30} {r['format']:<10} "
-              f"{r['fps']:>8.1f} {format_time(r['total_time_seconds']):>10} "
-              f"{r['vram_peak_mb']:>9.1f}MB {r['load_time_ms']:>9.0f}ms")
-    
-    print("=" * 80)
-    
-    # Лучшая модель по FPS
-    if successful:
-        best = max(successful, key=lambda x: x['fps'])
-        print(f"\n🏆 Лучшая по скорости: {best['model_name']} ({best['format']}) - {best['fps']:.1f} FPS")
+    best = max(successful, key=lambda x: x["fps"])
+    print(f"\n🏆 Лучшая: {best['model_name']} [{best['format'].upper()}] — {best['fps']:.1f} FPS")
+
+    skipped = [r for r in results if r.get("skipped")]
+    errors = [r for r in results if "error" in r]
+    if skipped:
+        print(f"⏭ Пропущено: {len(skipped)}  ({', '.join(r['model_name']+'/'+r['format'] for r in skipped[:3])}{'...' if len(skipped)>3 else ''})")
+    if errors:
+        print(f"✗ Ошибки:   {len(errors)}  ({', '.join(r['model_name']+'/'+r['format'] for r in errors[:3])}{'...' if len(errors)>3 else ''})")
 
 
 def main():
     print("=" * 60)
-    print("🚀 Бенчмаркинг моделей детекции")
+    print("YOLO Benchmark")
     print("=" * 60)
-    
-    # Проверяем CUDA
+
     if torch.cuda.is_available():
-        print(f"📟 GPU: {torch.cuda.get_device_name(0)}")
-        print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        gpu = torch.cuda.get_device_properties(0)
+        print(f"GPU:  {gpu.name}")
+        print(f"VRAM: {gpu.total_memory / 1024**3:.1f} GB")
     else:
-        print("📟 CUDA не доступна, используем CPU")
-    
-    # Проверяем пути
-    if not os.path.exists(VIDEO_PATH):
-        print(f"❌ Видео не найдено: {VIDEO_PATH}")
-        sys.exit(1)
-    
-    if not os.path.exists(MODELS_ROOT):
-        print(f"❌ Папка с моделями не найдена: {MODELS_ROOT}")
-        sys.exit(1)
-    
-    # Ищем модели
-    print(f"\n📁 Поиск моделей в: {MODELS_ROOT}")
+        print("CUDA недоступна — используем CPU")
+
+    onnx_cuda = check_onnx_cuda()
+    print(f"ONNX CUDA: {'✓' if onnx_cuda else '✗ (ONNX-модели будут пропущены)'}")
+
+    if not onnx_cuda:
+        print("\n  Чтобы починить ONNX CUDA, установи совместимую версию:")
+        print("  pip install onnxruntime-gpu==1.18.0   # для CUDA 12")
+        print("  или: pip install onnxruntime-gpu==1.16.3  # для CUDA 11")
+
+    for path, label in [(VIDEO_PATH, "Видео"), (MODELS_ROOT, "Модели")]:
+        if not os.path.exists(path):
+            print(f"\n✗ {label} не найден: {path}")
+            sys.exit(1)
+
     models = find_all_models(MODELS_ROOT)
-    print(f"   Найдено моделей: {len(models)}")
-    
     if not models:
-        print("   Модели не найдены")
+        print(f"Модели не найдены в {MODELS_ROOT}")
         sys.exit(1)
-    
-    # Оцениваем время
-    estimate_all_models(models, VIDEO_PATH)
-    
-    # Запрашиваем подтверждение
-    print("\n⏳ Запустить бенчмаркинг? (y/n): ", end="")
-    response = input().strip().lower()
-    if response != 'y':
-        print("Отменено.")
+
+    # Группируем для наглядности
+    by_format: dict[str, int] = {}
+    for m in models:
+        by_format[m["format"]] = by_format.get(m["format"], 0) + 1
+
+    print(f"\nНайдено моделей: {len(models)}")
+    for fmt, cnt in sorted(by_format.items()):
+        skipped_mark = " (будут пропущены — нет CUDA)" if fmt == "onnx" and not onnx_cuda else ""
+        print(f"  {fmt:>12}: {cnt}{skipped_mark}")
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_video = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    duration = total_frames / fps_video if fps_video > 0 else 0
+    print(f"\nВидео: {total_frames} кадров, {fps_video:.1f} FPS, ~{format_time(duration)}")
+    print(f"\nЗапуск последовательного бенчмарка (GPU эффективнее без параллелизма)")
+    print("Продолжить? (y/n): ", end="")
+    if input().strip().lower() != "y":
         sys.exit(0)
-    
-    # Запускаем бенчмаркинг
-    results = run_benchmark_parallel(models, VIDEO_PATH, OUTPUT_DIR, PARALLEL_MODELS)
-    
-    # Сохраняем результаты
+
+    results = []
+    t_start = time.time()
+
+    for i, model_info in enumerate(models, 1):
+        print(f"\n[{i}/{len(models)}]", end="")
+        result = run_model(model_info, VIDEO_PATH)
+        results.append(result)
+
+        elapsed = time.time() - t_start
+        done = i
+        remaining = len(models) - done
+        if done > 0 and remaining > 0:
+            eta = elapsed / done * remaining
+            print(f"  Общий прогресс: {done}/{len(models)} | осталось ~{format_time(eta)}")
+
     save_results(results, OUTPUT_DIR)
 
 
 if __name__ == "__main__":
-    # Для multiprocessing на Windows нужно это, но на Linux и так работает
-    # На всякий случай оставляем
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-    
     main()
