@@ -1,413 +1,787 @@
 #!/usr/bin/env python3
 """
-Бенчмаркинг YOLO-моделей в форматах pt, onnx, torchscript.
-Запускает модели последовательно (GPU не любит параллельные контексты).
-Сохраняет видео с bbox в benchmark_results_videos/<model_name>/<video_name>.
+YOLO / RT-DETR Benchmark + GT Evaluation
+
+Features:
+- Benchmark all YOLO/RT-DETR models
+- Benchmark all videos in folder
+- Save annotated videos
+- Save benchmark CSV/JSON
+- Evaluate against GT COCO JSON
+- Precision / Recall / F1
+- FPS / latency / VRAM
+
+Dataset structure:
+
+test_vids/
+├── vid1.mp4
+├── vid1.json
+├── vid2.mp4
+├── vid2.json
 """
+
 from __future__ import annotations
 
 import os
 import sys
-import time
-import json
 import gc
 import csv
+import json
+import time
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional, Any
 
-import torch
-import numpy as np
-import psutil
-from ultralytics import YOLO
 import cv2
+import torch
+import psutil
+import numpy as np
+
+from ultralytics import YOLO
 
 
-# ========== КОНФИГУРАЦИЯ ==========
-VIDEO_DIR = "../dataset/downloaded_videos/test_vids"   # папка с видео
+# ============================================================
+# CONFIG
+# ============================================================
+
+VIDEO_DIR = "../dataset/downloaded_videos/test_vids"
+
 MODELS_ROOT = "../yolo/runs/detect/yolo/runs"
+
 OUTPUT_DIR = "./benchmark_results"
-OUTPUT_VIDEO_DIR = "./benchmark_results_videos"        # папка для видео с bbox
+
+OUTPUT_VIDEO_DIR = "./benchmark_results_videos"
+
 CONF_THRESHOLD = 0.5
-IOU_THRESHOLD = 0.45
-WARMUP_FRAMES = 5   # кадров для прогрева модели перед замером
-SAVE_VIDEO = True   # False — отключить сохранение видео (быстрее)
-# ==================================
+
+IOU_THRESHOLD = 0.5
+
+SAVE_VIDEO = True
+
+WARMUP_FRAMES = 5
+
+# ============================================================
 
 
 def format_time(seconds: float) -> str:
+
     if seconds < 60:
-        return f"{seconds:.1f}с"
-    elif seconds < 3600:
-        return f"{seconds / 60:.1f}мин"
-    else:
-        return f"{seconds / 3600:.1f}ч"
+        return f"{seconds:.1f}s"
+
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+
+    return f"{seconds / 3600:.1f}h"
 
 
-def find_all_videos(video_dir: str) -> list[str]:
-    """Находит все видеофайлы в папке рекурсивно."""
+def find_all_videos(video_dir: str):
+
     exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-    root = Path(video_dir)
-    videos = sorted(str(p) for p in root.rglob("*") if p.suffix.lower() in exts)
-    return videos
+
+    return sorted([
+        str(p)
+        for p in Path(video_dir).rglob("*")
+        if p.suffix.lower() in exts
+    ])
 
 
-def find_all_models(models_root: str) -> list[dict]:
-    """Находит все модели в форматах pt, onnx, torchscript."""
+def find_all_models(models_root: str):
+
     models = []
-    root_path = Path(models_root)
 
-    for model_file in sorted(root_path.rglob("*")):
-        if model_file.suffix not in {".pt", ".onnx", ".torchscript"}:
+    for p in Path(models_root).rglob("best.*"):
+
+        if p.suffix not in {".pt", ".onnx", ".torchscript"}:
             continue
-
-        # Берём только файлы с именем best.*
-        if model_file.stem != "best":
-            continue
-
-        # Структура: runs/<model_name>/weights/best.pt
-        # parent = weights/, parent.parent = model_name/
-        model_name = model_file.parent.parent.name
 
         models.append({
-            "path": str(model_file),
-            "format": model_file.suffix[1:],  # без точки
-            "name": model_name,
-            "size_mb": model_file.stat().st_size / 1024 / 1024,
+            "path": str(p),
+            "name": p.parent.parent.name,
+            "format": p.suffix[1:],
+            "size_mb": p.stat().st_size / 1024 / 1024,
         })
 
     return models
 
 
-def check_onnx_cuda() -> bool:
-    """Проверяет, доступен ли CUDA для ONNX Runtime."""
+def check_onnx_cuda():
+
     try:
         import onnxruntime as ort
+
         return "CUDAExecutionProvider" in ort.get_available_providers()
+
     except ImportError:
         return False
 
 
-def make_video_writer(
-    output_path: str,
-    width: int,
-    height: int,
-    fps: float,
-) -> cv2.VideoWriter:
-    """Создаёт VideoWriter с кодеком mp4v."""
+def calculate_iou(box1, box2):
+
+    x1 = max(box1[0], box2[0])
+
+    y1 = max(box1[1], box2[1])
+
+    x2 = min(box1[0] + box1[2], box2[0] + box2[2])
+
+    y2 = min(box1[1] + box1[3], box2[1] + box2[3])
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    intersection = (x2 - x1) * (y2 - y1)
+
+    area1 = box1[2] * box1[3]
+
+    area2 = box2[2] * box2[3]
+
+    union = area1 + area2 - intersection
+
+    return intersection / union if union > 0 else 0
+
+
+def load_gt(gt_json_path: str):
+
+    with open(gt_json_path, "r", encoding="utf-8") as f:
+
+        data = json.load(f)
+
+    gt_by_frame = {}
+
+    for ann in data.get("annotations", []):
+
+        frame_id = ann["image_id"]
+
+        if frame_id not in gt_by_frame:
+            gt_by_frame[frame_id] = []
+
+        gt_by_frame[frame_id].append(ann["bbox"])
+
+    return gt_by_frame
+
+
+def evaluate_predictions(
+    predictions: dict,
+    gt_data: dict,
+    iou_threshold: float = 0.5
+):
+
+    tp = 0
+    fp = 0
+    fn = 0
+
+    frame_ids = set(predictions.keys()) | set(gt_data.keys())
+
+    for frame_id in frame_ids:
+
+        pred_boxes = predictions.get(frame_id, [])
+
+        gt_boxes = gt_data.get(frame_id, [])
+
+        matched_gt = set()
+
+        for pred_box in pred_boxes:
+
+            best_iou = 0
+
+            best_gt_idx = -1
+
+            for gt_idx, gt_box in enumerate(gt_boxes):
+
+                if gt_idx in matched_gt:
+                    continue
+
+                iou = calculate_iou(pred_box, gt_box)
+
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = gt_idx
+
+            if best_iou >= iou_threshold:
+
+                tp += 1
+
+                matched_gt.add(best_gt_idx)
+
+            else:
+
+                fp += 1
+
+        fn += len(gt_boxes) - len(matched_gt)
+
+    precision = tp / (tp + fp) if tp + fp > 0 else 0
+
+    recall = tp / (tp + fn) if tp + fn > 0 else 0
+
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall > 0 else 0
+    )
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+    }
+
+
+def make_video_writer(output_path, width, height, fps):
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    writer = cv2.VideoWriter(
+        output_path,
+        fourcc,
+        fps,
+        (width, height)
+    )
+
     if not writer.isOpened():
-        raise RuntimeError(f"Не удалось открыть VideoWriter для {output_path}")
+        raise RuntimeError(f"Cannot open writer: {output_path}")
+
     return writer
 
 
-def run_model(model_info: dict, video_path: str) -> dict:
-    """
-    Запускает инференс одной модели на одном видео и возвращает метрики.
-    Если SAVE_VIDEO=True — сохраняет видео с нарисованными bbox.
-    """
+def run_model(model_info: dict, video_path: str):
+
     model_path = model_info["path"]
-    model_format = model_info["format"]
+
     model_name = model_info["name"]
+
+    model_format = model_info["format"]
+
     video_name = Path(video_path).name
+
     video_stem = Path(video_path).stem
 
-    print(f"\n{'─'*60}")
-    print(f"▶ {model_name} [{model_format.upper()}]  {model_info['size_mb']:.1f} MB")
-    print(f"  Видео: {video_name}")
+    print("\n" + "=" * 60)
 
-    # ONNX без CUDA-провайдера — пропускаем
-    if model_format == "onnx" and not check_onnx_cuda():
-        print("  ⚠ ONNX CUDA недоступен — пропускаем модель")
-        return {
-            "model_name": model_name,
-            "video_name": video_name,
-            "format": model_format,
-            "skipped": True,
-            "skip_reason": "ONNX CUDA unavailable",
-            "timestamp": datetime.now().isoformat(),
-        }
+    print(f"{model_name} [{model_format}] -> {video_name}")
 
-    # Путь для сохранения видео: benchmark_results_videos/<model_name>/<video_stem>.<format>.mp4
-    output_video_path: str | None = None
+    # ============================================================
+    # GT
+    # ============================================================
+
+    gt_json_path = str(Path(video_path).with_suffix(".json"))
+
+    gt_data = None
+
+    if os.path.exists(gt_json_path):
+
+        try:
+
+            gt_data = load_gt(gt_json_path)
+
+            print(f"GT loaded: {Path(gt_json_path).name}")
+
+        except Exception as e:
+
+            print(f"GT ERROR: {e}")
+
+    else:
+
+        print("GT NOT FOUND")
+
+    # ============================================================
+    # OUTPUT VIDEO
+    # ============================================================
+
+    output_video_path = None
+
     if SAVE_VIDEO:
-        video_out_dir = Path(OUTPUT_VIDEO_DIR) / model_name
-        video_out_dir.mkdir(parents=True, exist_ok=True)
-        output_video_path = str(video_out_dir / f"{video_stem}__{model_format}.mp4")
+
+        out_dir = Path(OUTPUT_VIDEO_DIR) / model_name
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        output_video_path = str(
+            out_dir / f"{video_stem}__{model_format}.mp4"
+        )
+
+    # ============================================================
 
     try:
-        # --- Загрузка ---
+
         torch.cuda.empty_cache()
+
         gc.collect()
 
         ram_before = psutil.Process().memory_info().rss / 1024 / 1024
+
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        vram_before = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
 
         t_load = time.perf_counter()
+
         model = YOLO(model_path)
+
         load_ms = (time.perf_counter() - t_load) * 1000
 
-        ram_after = psutil.Process().memory_info().rss / 1024 / 1024
-        vram_after = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
-        print(f"  Загрузка: {load_ms:.0f}ms  |  VRAM δ: {vram_after - vram_before:+.1f}MB")
+        print(f"Model loaded: {load_ms:.0f} ms")
 
-        # --- Получаем параметры видео ---
+        # ============================================================
+
         cap = cv2.VideoCapture(video_path)
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
         video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         cap.release()
 
-        # --- Прогрев ---
-        print(f"  Прогрев ({WARMUP_FRAMES} кадров)...", end=" ", flush=True)
-        warmup_done = 0
-        for _ in model(video_path, stream=True, conf=CONF_THRESHOLD,
-                       iou=IOU_THRESHOLD, verbose=False):
-            warmup_done += 1
-            if warmup_done >= WARMUP_FRAMES:
+        # ============================================================
+        # WARMUP
+        # ============================================================
+
+        warmup = 0
+
+        for _ in model(
+            video_path,
+            stream=True,
+            conf=CONF_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            verbose=False,
+        ):
+
+            warmup += 1
+
+            if warmup >= WARMUP_FRAMES:
                 break
-        print("готово")
 
-        # --- Инференс + запись видео ---
-        save_info = f" + запись видео → {Path(output_video_path).name}" if output_video_path else ""
-        print(f"  Инференс ({total_frames} кадров){save_info}...")
+        # ============================================================
 
-        frame_times_ms: list[float] = []
+        predictions = {}
+
+        frame_times = []
+
         frame_count = 0
+
+        writer = None
+
+        t0 = time.time()
+
         last_report = time.time()
-        t_inference_start = time.time()
 
-        writer: cv2.VideoWriter | None = None
+        # ============================================================
+        # INFERENCE
+        # ============================================================
 
-        for result in model(video_path, stream=True, conf=CONF_THRESHOLD,
-                            iou=IOU_THRESHOLD, verbose=False):
+        for result in model(
+            video_path,
+            stream=True,
+            conf=CONF_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            verbose=False,
+        ):
 
-            # Время на этот кадр
-            spd = result.speed
-            frame_ms = spd.get("preprocess", 0) + spd.get("inference", 0) + spd.get("postprocess", 0)
-            frame_times_ms.append(frame_ms)
-            frame_count += 1
+            predictions[frame_count] = []
 
-            # Сохраняем кадр с bbox
+            if result.boxes is not None:
+
+                boxes = result.boxes.xyxy.cpu().numpy()
+
+                confs = result.boxes.conf.cpu().numpy()
+
+                classes = result.boxes.cls.cpu().numpy()
+
+                for box, conf, cls in zip(boxes, confs, classes):
+
+                    x1, y1, x2, y2 = box
+
+                    w = x2 - x1
+
+                    h = y2 - y1
+
+                    predictions[frame_count].append([
+                        float(x1),
+                        float(y1),
+                        float(w),
+                        float(h)
+                    ])
+
+            # ============================================================
+            # SAVE VIDEO
+            # ============================================================
+
             if output_video_path is not None:
-                # result.plot() возвращает BGR numpy array с нарисованными bbox
+
                 annotated_frame = result.plot()
+
                 if writer is None:
+
                     h, w = annotated_frame.shape[:2]
-                    writer = make_video_writer(output_video_path, w, h, video_fps)
+
+                    writer = make_video_writer(
+                        output_video_path,
+                        w,
+                        h,
+                        video_fps
+                    )
+
                 writer.write(annotated_frame)
 
+            # ============================================================
+
+            speed = result.speed
+
+            frame_ms = (
+                speed.get("preprocess", 0)
+                + speed.get("inference", 0)
+                + speed.get("postprocess", 0)
+            )
+
+            frame_times.append(frame_ms)
+
+            frame_count += 1
+
+            # ============================================================
+            # PROGRESS
+            # ============================================================
+
             now = time.time()
-            if now - last_report >= 5.0:
-                elapsed = now - t_inference_start
-                fps_so_far = frame_count / elapsed if elapsed > 0 else 0
-                eta = (total_frames - frame_count) / fps_so_far if fps_so_far > 0 else 0
-                pct = 100 * frame_count / total_frames
-                print(f"    {pct:5.1f}%  {frame_count}/{total_frames}  "
-                      f"{fps_so_far:.1f} FPS  осталось ~{format_time(eta)}")
+
+            if now - last_report >= 5:
+
+                elapsed = now - t0
+
+                fps_now = frame_count / elapsed
+
+                eta = (
+                    (total_frames - frame_count) / fps_now
+                    if fps_now > 0 else 0
+                )
+
+                print(
+                    f"{100 * frame_count / total_frames:.1f}% | "
+                    f"{frame_count}/{total_frames} | "
+                    f"{fps_now:.1f} FPS | "
+                    f"ETA {format_time(eta)}"
+                )
+
                 last_report = now
 
+        # ============================================================
+
         if writer is not None:
+
             writer.release()
-            print(f"  💾 Видео сохранено: {output_video_path}")
 
-        total_time = time.time() - t_inference_start
+            print(f"Video saved: {output_video_path}")
+
+        total_time = time.time() - t0
+
         fps = frame_count / total_time if total_time > 0 else 0
-        vram_peak = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
 
-        arr = np.array(frame_times_ms) if frame_times_ms else np.array([0.0])
+        # ============================================================
+        # GT EVAL
+        # ============================================================
+
+        eval_metrics = {}
+
+        if gt_data is not None:
+
+            eval_metrics = evaluate_predictions(
+                predictions,
+                gt_data,
+                iou_threshold=IOU_THRESHOLD
+            )
+
+            print(
+                f"P={eval_metrics['precision']:.3f} | "
+                f"R={eval_metrics['recall']:.3f} | "
+                f"F1={eval_metrics['f1']:.3f}"
+            )
+
+        # ============================================================
+
         metrics = {
             "model_name": model_name,
+
             "video_name": video_name,
+
             "format": model_format,
-            "model_path": model_path,
-            "model_size_mb": round(model_info["size_mb"], 2),
-            "load_time_ms": round(load_ms, 1),
-            "total_frames": frame_count,
-            "total_time_seconds": round(total_time, 2),
+
             "fps": round(fps, 2),
-            "frame_time_avg_ms": round(float(np.mean(arr)), 2),
-            "frame_time_p50_ms": round(float(np.percentile(arr, 50)), 2),
-            "frame_time_p95_ms": round(float(np.percentile(arr, 95)), 2),
-            "frame_time_p99_ms": round(float(np.percentile(arr, 99)), 2),
-            "vram_peak_mb": round(vram_peak, 1),
-            "ram_delta_mb": round(ram_after - ram_before, 1),
+
+            "load_time_ms": round(load_ms, 1),
+
+            "frame_time_avg_ms": round(
+                float(np.mean(frame_times)),
+                2
+            ),
+
+            "frame_time_p50_ms": round(
+                float(np.percentile(frame_times, 50)),
+                2
+            ),
+
+            "frame_time_p95_ms": round(
+                float(np.percentile(frame_times, 95)),
+                2
+            ),
+
+            "frame_time_p99_ms": round(
+                float(np.percentile(frame_times, 99)),
+                2
+            ),
+
+            "vram_peak_mb": round(
+                torch.cuda.max_memory_allocated() / 1024 / 1024,
+                1
+            ) if torch.cuda.is_available() else 0,
+
+            "ram_delta_mb": round(
+                psutil.Process().memory_info().rss / 1024 / 1024 - ram_before,
+                1
+            ),
+
+            "total_frames": frame_count,
+
             "output_video": output_video_path,
+
             "timestamp": datetime.now().isoformat(),
+
+            **eval_metrics,
         }
 
-        print(f"  ✓ FPS: {fps:.1f}  |  avg: {metrics['frame_time_avg_ms']}ms  "
-              f"|  p95: {metrics['frame_time_p95_ms']}ms  "
-              f"|  VRAM peak: {vram_peak:.0f}MB")
         return metrics
 
     except Exception as e:
-        print(f"  ✗ Ошибка: {e}")
-        # Закрываем writer если был открыт
-        try:
-            if writer is not None:
-                writer.release()
-        except Exception:
-            pass
+
+        print(f"ERROR: {e}")
+
         return {
             "model_name": model_name,
             "video_name": video_name,
-            "format": model_format,
             "error": str(e),
-            "timestamp": datetime.now().isoformat(),
         }
 
     finally:
+
         try:
             del model
-        except NameError:
+        except Exception:
             pass
+
         torch.cuda.empty_cache()
+
         gc.collect()
 
 
-def save_results(results: list[dict], output_dir: str) -> None:
+def save_results(results, output_dir):
+
     out = Path(output_dir)
+
     out.mkdir(parents=True, exist_ok=True)
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # JSON — всё включая ошибки и пропуски
-    json_path = out / f"benchmark_{ts}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    print(f"\n📄 JSON: {json_path}")
+    # ============================================================
+    # JSON
+    # ============================================================
 
-    # CSV — только успешные
+    json_path = out / f"benchmark_{ts}.json"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+
+        json.dump(
+            results,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    print(f"JSON saved: {json_path}")
+
+    # ============================================================
+    # CSV
+    # ============================================================
+
     successful = [r for r in results if "fps" in r]
+
     if not successful:
-        print("  Нет успешных результатов для CSV")
         return
 
     csv_path = out / f"benchmark_{ts}.csv"
+
     fields = [
-        "model_name", "video_name", "format", "model_size_mb", "load_time_ms",
-        "fps", "total_time_seconds", "frame_time_avg_ms",
-        "frame_time_p50_ms", "frame_time_p95_ms", "frame_time_p99_ms",
-        "vram_peak_mb", "ram_delta_mb", "total_frames", "output_video",
+        "model_name",
+        "video_name",
+        "format",
+
+        "fps",
+
+        "precision",
+        "recall",
+        "f1",
+
+        "tp",
+        "fp",
+        "fn",
+
+        "frame_time_avg_ms",
+        "frame_time_p50_ms",
+        "frame_time_p95_ms",
+        "frame_time_p99_ms",
+
+        "vram_peak_mb",
+
+        "ram_delta_mb",
+
+        "total_frames",
     ]
+
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(successful)
-    print(f"📊 CSV:  {csv_path}")
 
-    # Таблица в консоль — группируем по видео
-    print(f"\n{'═'*90}")
-    print("РЕЗУЛЬТАТЫ  (сортировка по FPS ↓)")
-    print(f"{'═'*90}")
-    header = (f"{'Модель':<20} {'Видео':<15} {'Формат':<12} "
-              f"{'FPS':>7} {'avg ms':>8} {'p95 ms':>8} {'VRAM MB':>8} {'Размер':>8}")
-    print(header)
-    print("─" * 90)
-
-    for r in sorted(successful, key=lambda x: x["fps"], reverse=True):
-        vname = r.get("video_name", "")[:14]
-        print(
-            f"{r['model_name'][:20]:<20} {vname:<15} {r['format']:<12} "
-            f"{r['fps']:>7.1f} {r['frame_time_avg_ms']:>8.1f} "
-            f"{r['frame_time_p95_ms']:>8.1f} {r['vram_peak_mb']:>8.0f} "
-            f"{r['model_size_mb']:>7.1f}M"
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fields,
+            extrasaction="ignore"
         )
 
-    best = max(successful, key=lambda x: x["fps"])
-    print(f"\n🏆 Лучшая: {best['model_name']} [{best['format'].upper()}] "
-          f"на {best.get('video_name','')} — {best['fps']:.1f} FPS")
+        writer.writeheader()
 
-    skipped = [r for r in results if r.get("skipped")]
-    errors = [r for r in results if "error" in r]
-    if skipped:
-        names = ', '.join(r['model_name'] + '/' + r['format'] for r in skipped[:3])
-        print(f"⏭ Пропущено: {len(skipped)}  ({names}{'...' if len(skipped) > 3 else ''})")
-    if errors:
-        names = ', '.join(r['model_name'] + '/' + r['format'] for r in errors[:3])
-        print(f"✗ Ошибки:   {len(errors)}  ({names}{'...' if len(errors) > 3 else ''})")
+        writer.writerows(successful)
+
+    print(f"CSV saved: {csv_path}")
+
+    # ============================================================
+    # CONSOLE TABLE
+    # ============================================================
+
+    print("\n" + "=" * 100)
+
+    print("RESULTS")
+
+    print("=" * 100)
+
+    for r in sorted(successful, key=lambda x: x["fps"], reverse=True):
+
+        print(
+            f"{r['model_name']:<20} "
+            f"{r['video_name']:<15} "
+            f"{r['fps']:>7.1f} FPS | "
+            f"P={r.get('precision',0):.3f} | "
+            f"R={r.get('recall',0):.3f} | "
+            f"F1={r.get('f1',0):.3f} | "
+            f"VRAM={r['vram_peak_mb']:.0f}MB"
+        )
 
 
 def main():
+
     print("=" * 60)
-    print("YOLO Benchmark")
+
+    print("YOLO Benchmark + GT Evaluation")
+
     print("=" * 60)
+
+    # ============================================================
 
     if torch.cuda.is_available():
+
         gpu = torch.cuda.get_device_properties(0)
-        print(f"GPU:  {gpu.name}")
+
+        print(f"GPU: {gpu.name}")
+
         print(f"VRAM: {gpu.total_memory / 1024**3:.1f} GB")
+
     else:
-        print("CUDA недоступна — используем CPU")
+
+        print("CUDA NOT AVAILABLE")
+
+    # ============================================================
 
     onnx_cuda = check_onnx_cuda()
-    print(f"ONNX CUDA: {'✓' if onnx_cuda else '✗ (ONNX-модели будут пропущены)'}")
-    if not onnx_cuda:
-        print("  Для CUDA 12: pip install onnxruntime-gpu==1.18.0")
-        print("  Для CUDA 11: pip install onnxruntime-gpu==1.16.3")
 
-    print(f"Сохранение видео с bbox: {'✓' if SAVE_VIDEO else '✗'}")
+    print(f"ONNX CUDA: {'YES' if onnx_cuda else 'NO'}")
 
-    for path, label in [(VIDEO_DIR, "Папка с видео"), (MODELS_ROOT, "Папка с моделями")]:
+    print(f"SAVE VIDEO: {'YES' if SAVE_VIDEO else 'NO'}")
+
+    # ============================================================
+
+    for path, label in [
+        (VIDEO_DIR, "VIDEO DIR"),
+        (MODELS_ROOT, "MODELS DIR")
+    ]:
+
         if not os.path.exists(path):
-            print(f"\n✗ {label} не найден: {path}")
+
+            print(f"{label} NOT FOUND: {path}")
+
             sys.exit(1)
 
+    # ============================================================
+
     videos = find_all_videos(VIDEO_DIR)
-    if not videos:
-        print(f"Видео не найдены в {VIDEO_DIR}")
-        sys.exit(1)
 
     models = find_all_models(MODELS_ROOT)
-    if not models:
-        print(f"Модели не найдены в {MODELS_ROOT}")
-        sys.exit(1)
 
-    # Группируем модели по формату для наглядности
-    by_format: dict[str, int] = {}
-    for m in models:
-        by_format[m["format"]] = by_format.get(m["format"], 0) + 1
+    # ============================================================
 
-    print(f"\nНайдено видео: {len(videos)}")
+    print(f"\nVIDEOS: {len(videos)}")
+
     for v in videos:
         print(f"  {Path(v).name}")
 
-    print(f"\nНайдено моделей: {len(models)}")
-    for fmt, cnt in sorted(by_format.items()):
-        skipped_mark = " (будут пропущены — нет CUDA)" if fmt == "onnx" and not onnx_cuda else ""
-        print(f"  {fmt:>12}: {cnt}{skipped_mark}")
+    print(f"\nMODELS: {len(models)}")
 
-    total_runs = len(models) * len(videos)
-    print(f"\nВсего запусков: {len(models)} моделей × {len(videos)} видео = {total_runs}")
-    if SAVE_VIDEO:
-        print(f"Видео с bbox → {OUTPUT_VIDEO_DIR}/<model_name>/<video>__<format>.mp4")
+    for m in models:
+        print(f"  {m['name']} [{m['format']}]")
 
-    print("\nПродолжить? (y/n): ", end="")
+    total_runs = len(videos) * len(models)
+
+    print(f"\nTOTAL RUNS: {total_runs}")
+
+    print("\nContinue? (y/n): ", end="")
+
     if input().strip().lower() != "y":
+
         sys.exit(0)
 
+    # ============================================================
+
     results = []
-    t_start = time.time()
+
     run_idx = 0
 
-    for i, model_info in enumerate(models, 1):
-        for j, video_path in enumerate(videos, 1):
+    t0 = time.time()
+
+    for model_info in models:
+
+        for video_path in videos:
+
             run_idx += 1
-            print(f"\n[{run_idx}/{total_runs}] модель {i}/{len(models)}, видео {j}/{len(videos)}", end="")
-            result = run_model(model_info, video_path)
+
+            print(f"\n[{run_idx}/{total_runs}]")
+
+            result = run_model(
+                model_info,
+                video_path
+            )
+
             results.append(result)
 
-            elapsed = time.time() - t_start
+            elapsed = time.time() - t0
+
             remaining = total_runs - run_idx
-            if run_idx > 0 and remaining > 0:
+
+            if remaining > 0:
+
                 eta = elapsed / run_idx * remaining
-                print(f"  Прогресс: {run_idx}/{total_runs} | осталось ~{format_time(eta)}")
+
+                print(f"ETA: {format_time(eta)}")
+
+    # ============================================================
 
     save_results(results, OUTPUT_DIR)
+
+    print("\nDONE")
 
 
 if __name__ == "__main__":
